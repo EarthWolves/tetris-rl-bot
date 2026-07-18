@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# tetris-rl-bot local dev artifacts
+.browser_profile/
+.reference_captures/

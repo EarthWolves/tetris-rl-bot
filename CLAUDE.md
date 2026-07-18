@@ -17,22 +17,45 @@ involved. Keep the boundary between them a plain data interface (think Gym/Gymna
 API: `reset()`, `step(action) -> (obs, reward, done, info)`), so the agent layer could in
 principle train against a local simulator with zero changes.
 
-## Interface layer: hybrid extraction
+## Interface layer: classical CV over canvas, not JS/DOM extraction
 
-- **Primary path: Playwright + JS/DOM/WebSocket extraction.** Drive a real browser session with
-  Playwright and pull board state, current/next/hold piece, and game events directly from the
-  page's JS state, DOM, or WebSocket traffic. This is deterministic, fast, and cheap — always
-  prefer it.
-- **Fallback path: vision model on screenshots.** Only fall back to screenshotting the canvas and
-  parsing it (CV or a vision model) if tetr.io's client changes in a way that breaks JS-level
-  extraction, or obfuscates state we need. Treat this as a degraded mode: slower, noisier, and
-  costs inference calls. Don't build agent logic that assumes vision-path latency/noise
-  characteristics as the norm.
+Research spikes (Playwright against the live client) ruled out the JS/DOM extraction path we
+originally hoped for:
+
+- `window` exposes no usable game state — broad global scans turn up nothing but ad-tech/analytics
+  cruft.
+- The client renders through **PixiJS onto two small canvases** (`#pixi`, `#pixi-fg`, 256×256px),
+  not DOM nodes — there's nothing per-block to scrape from the DOM.
+- The main bootstrap bundle is **deliberately obfuscated** (string-array encoding + control-flow
+  flattening, not just minification) — there is no plaintext identifier to grep for, and no
+  in-clear reference to other loaded chunks. Pushing further into deobfuscating it to find the
+  live engine object would mean actively defeating a protection built to stop exactly this kind of
+  automation, which conflicts with hard constraint #3 below. Don't go there.
+- tetr.io does run a real-time binary protocol over WebSocket (`wss://*.spool.tetr.io/ribbon/*`,
+  1-byte opcode + concatenated MessagePack objects) for lobby/menu/social state, confirmed
+  reverse-engineerable — but it was not confirmed to carry solo-mode board/piece state per tick,
+  and reverse-engineering it further is likewise low-value relative to the CV path below.
+
+**Chosen approach: classical CV over canvas screenshots, not a vision-language model.** The board
+is a fixed-size grid of solid-colored blocks — this is a pixel-grid-sampling / color-thresholding
+problem (Pillow/OpenCV/NumPy), not an image-understanding one. Read the canvas via Playwright
+screenshot, sample cell-center pixel colors against a known board grid geometry and piece color
+palette, and derive the logical board/piece/queue/hold state from that. This must run many times
+per second for RL training, so a per-frame LLM vision call is not viable as the primary loop — it
+may be useful once for bootstrapping/validating the CV calibration, but the runtime path must be
+CV-only.
+
 - Action injection (moves, rotations, hold, drops) should go through Playwright's input
-  simulation (keyboard/mouse events against the page), not through hidden hooks into game
-  internals — this keeps the bot's actions equivalent to what a human player could do.
-- Isolate all tetr.io-specific scraping/DOM/selector logic behind one module boundary. tetr.io
-  will change its client over time; when it does, only that module should need to change.
+  simulation (`page.keyboard`, which dispatches trusted CDP-level events) against the real page,
+  not `dispatchEvent`-style JS injection (untrusted events are often ignored by canvas games) and
+  not hooks into game internals — this keeps the bot's actions equivalent to what a human player
+  could do.
+- Isolate all tetr.io-specific pixel-geometry/calibration/color-palette logic behind one module
+  boundary. tetr.io will change its client over time; when it does, only that module (and its
+  calibration constants) should need to change.
+- Use a **persistent Playwright browser profile** (not a fresh context per run) — a cold profile
+  takes tetr.io's client roughly 200s to boot before it's interactive; a warm one boots in ~15s.
+  This matters for anything that launches the browser repeatedly (dev iteration, restarts).
 
 ## Agent layer: Deep Q-Network
 
@@ -45,6 +68,17 @@ principle train against a local simulator with zero changes.
 - Reward shaping, network architecture, and hyperparameters are open design questions — expect
   these to evolve. What is **not** open for debate without discussion: the use of a neural
   Q-function, replay buffer, and target network as the foundation.
+
+## Known ToS risk — not resolved by these constraints
+
+Confirmed by reading tetr.io's actual rules page: bots, macros, and automation of any kind on a
+normal account are **banned on sight** for both the bot and its operator, with no documented
+exception process in the rules themselves. The constraints below (single session, human-plausible
+timing, no evasion) are there to keep this project's footprint honest and small — they are risk
+*mitigation*, not ToS *compliance*. Automated play against the live service is a ban risk on
+whatever account runs it, full stop. Treat that as a standing, accepted tradeoff of this project,
+not something to re-litigate per session — but also don't act surprised if the account gets
+banned, and don't use a primary/important account to run this.
 
 ## Hard constraints — must not be violated
 
